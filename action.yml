@@ -1,5 +1,5 @@
 name: Dokkimi Run Tests
-description: Install k3s, set up a single-node Kubernetes cluster, and run Dokkimi integration tests.
+description: Run Dokkimi integration tests using Docker. Generates a JUnit XML report and posts a test summary to the GitHub Actions job summary.
 branding:
   icon: check-circle
   color: blue
@@ -8,10 +8,10 @@ inputs:
     description: Path to .dokkimi/ directory or a specific definition file
     required: true
   max-parallel:
-    description: Maximum concurrent test namespaces
+    description: Maximum concurrent test environments
     default: '6'
   max-booting:
-    description: Maximum namespaces booting simultaneously
+    description: Maximum environments booting simultaneously
     default: '2'
   timeout:
     description: HTTP request timeout in milliseconds
@@ -22,6 +22,15 @@ inputs:
   viewport-height:
     description: Default browser viewport height for UI tests
     default: '720'
+  junit-dir:
+    description: Directory to accumulate JUnit XML reports
+    default: dokkimi-junit-reports
+  dump-retention-days:
+    description: Days to retain the failed-run dump artifact (0 to disable)
+    default: '1'
+  report:
+    description: Post test summary to job summary and PR comment. Set to false for intermediate runs in multi-project setups.
+    default: 'true'
   dokkimi-version:
     description: Dokkimi CLI version to install
     default: latest
@@ -29,28 +38,34 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Post in-progress comment
+      if: github.event_name == 'pull_request' && inputs.report == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        PR=${{ github.event.pull_request.number }}
+        RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        BODY="<!-- dokkimi-test-results -->
+        ### :hourglass_flowing_sand: Dokkimi Test Results
+
+        Tests are running... [View progress](${RUN_URL})"
+        COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments" --jq '.[] | select(.body | contains("<!-- dokkimi-test-results -->")) | .id' | tail -1)
+        if [ -n "$COMMENT_ID" ]; then
+          gh api "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}" -X PATCH -f body="$BODY"
+        else
+          echo "$BODY" | gh pr comment "$PR" --body-file -
+        fi
+
     - name: Free disk space
       shell: bash
       run: |
         sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/powershell
         docker builder prune -af
 
-    - name: Install k3s
+    - name: Pull sidecar images
       shell: bash
       run: |
-        curl -sfL https://get.k3s.io | \
-          INSTALL_K3S_EXEC="--docker --disable=traefik --write-kubeconfig-mode=644" sh -
-        export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-        until kubectl get nodes | grep -q ' Ready'; do sleep 2; done
-        echo "KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> $GITHUB_ENV
-        NODE_IP=$(kubectl get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
-        echo "CONTROL_TOWER_HOST=$NODE_IP" >> $GITHUB_ENV
-
-    - name: Pull external images
-      shell: bash
-      run: |
-        docker pull busybox:1.37
-        docker pull fluent/fluent-bit:3.2
         docker pull andyshinn/dnsmasq:2.83
 
     - name: Install Dokkimi CLI
@@ -65,15 +80,64 @@ runs:
     - name: Run tests
       shell: bash
       env:
+        CONTROL_TOWER_HOST: 0.0.0.0
         DOKKIMI_MAX_CONCURRENT_NAMESPACES: ${{ inputs.max-parallel }}
         DOKKIMI_MAX_BOOTING_NAMESPACES: ${{ inputs.max-booting }}
         DOKKIMI_HTTP_TIMEOUT: ${{ inputs.timeout }}
         DOKKIMI_DEFAULT_VIEWPORT_WIDTH: ${{ inputs.viewport-width }}
         DOKKIMI_DEFAULT_VIEWPORT_HEIGHT: ${{ inputs.viewport-height }}
-      run: dokkimi run ${{ inputs.tests }} --ci
+      run: |
+        SLUG=$(echo "${{ inputs.tests }}" | sed 's|[^a-zA-Z0-9]|-|g' | sed 's|-\+|-|g' | sed 's|^-\|-$||g')
+        dokkimi run ${{ inputs.tests }} --ci --junit "${{ inputs.junit-dir }}/${SLUG}.xml"
+
+    - name: Upload JUnit reports
+      if: always()
+      uses: actions/upload-artifact@v5
+      with:
+        name: dokkimi-junit-reports
+        path: ${{ inputs.junit-dir }}/
+        if-no-files-found: ignore
+        overwrite: true
+
+    - name: Test report
+      if: always() && inputs.report == 'true'
+      shell: bash
+      run: dokkimi junit --summary --dir "${{ inputs.junit-dir }}" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Comment on PR
+      if: always() && inputs.report == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        PR=${{ github.event.pull_request.number }}
+        RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        SUMMARY=$(dokkimi junit --summary --dir "${{ inputs.junit-dir }}")
+        BODY=$(printf '%s\n\n[View full output](%s)' "$SUMMARY" "$RUN_URL")
+        COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments" --jq '.[] | select(.body | contains("<!-- dokkimi-test-results -->")) | .id' | tail -1)
+        if [ -n "$COMMENT_ID" ]; then
+          gh api "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}" -X PATCH -f body="$BODY"
+        else
+          echo "$BODY" | gh pr comment "$PR" --body-file -
+        fi
+
+    - name: Dump failed results
+      if: failure() && inputs.dump-retention-days != '0'
+      shell: bash
+      run: |
+        dokkimi dump --failed || true
+        found=$(find "$HOME/.dokkimi/runs" -name dump_failed.json -type f 2>/dev/null | sort | tail -1)
+        [ -n "$found" ] && cp "$found" /tmp/dokkimi-dump.json || echo "no dump file found" > /tmp/dokkimi-dump.json
+
+    - name: Upload dump artifact
+      if: failure() && inputs.dump-retention-days != '0'
+      uses: actions/upload-artifact@v5
+      with:
+        name: dokkimi-failed-dump
+        path: /tmp/dokkimi-dump.json
+        retention-days: ${{ inputs.dump-retention-days }}
 
     - name: Cleanup
       if: always()
       shell: bash
-      run: |
-        /usr/local/bin/k3s-uninstall.sh || true
+      run: dokkimi clean 2>/dev/null || true
